@@ -64,7 +64,7 @@ static std::string cors_origin(const std::string & allowed, const httplib::Reque
 
 // one generation with the console progress bar, emit gets each decoded chunk and false stops it
 static void run_generation(BreezeModel & model, MimiCodec & codec, const GenRequest & g, int sr, bool verbose,
-                           const AudioCallback & emit) {
+                           const AudioCallback & emit, RefPrefix * prefix) {
     GenTimings tm;
     const auto t0 = std::chrono::steady_clock::now();
     const auto elapsed = [&] {
@@ -86,7 +86,7 @@ static void run_generation(BreezeModel & model, MimiCodec & codec, const GenRequ
                    mmss(wall).c_str(), mmss(eta).c_str(), secs * 12.5 / wall, rate);
             fflush(stdout);
             return true;
-        }, &tm);
+        }, &tm, prefix);
     } catch (const std::exception & e) {
         fprintf(stderr, "\ngeneration error: %s\n", e.what());
     }
@@ -135,6 +135,9 @@ int run_server(const ServerOptions & opts) {
 
     httplib::Server svr;
     auto mutex = std::make_shared<std::mutex>();
+    // a cloned voice prefills the same reference on every request, so the states are kept for the
+    // next one instead of being thrown away with the request that built them
+    auto prefix = std::make_shared<RefPrefix>();
     const int sr = model.cfg.sample_rate;
 
     VoiceStore store;
@@ -145,7 +148,7 @@ int run_server(const ServerOptions & opts) {
     const int ws_port = opts.ws_port == 0 ? opts.port + 1 : opts.ws_port;
     if (ws_port > 0) {
         const bool up = ws.start(opts.host, ws_port, [&](WsConn & c) {
-            ws_connection(c, model, codec, store, *mutex, opts.chunk_first, opts.chunk_max, opts.split_chars);
+            ws_connection(c, model, codec, store, *mutex, *prefix, opts.chunk_first, opts.chunk_max, opts.split_chars);
         });
         if (up) printf("websocket on ws://%s:%d\n", opts.host.c_str(), ws_port);
         else fprintf(stderr, "could not open the websocket port %d\n", ws_port);
@@ -185,7 +188,7 @@ int run_server(const ServerOptions & opts) {
         fflush(stdout);
 
         res.set_chunked_content_provider(
-            ctype, [&model, &codec, g = o.g, sse = o.sse, enc, lock, sr, verbose = opts.verbose](
+            ctype, [&model, &codec, g = o.g, sse = o.sse, enc, lock, sr, verbose = opts.verbose, prefix](
                        size_t, httplib::DataSink & sink) {
                 std::string buf;
                 const auto flush = [&] {
@@ -200,7 +203,7 @@ int run_server(const ServerOptions & opts) {
                     run_generation(model, codec, g, sr, verbose, [&](const float * s, int n) {
                         enc->write(s, n, buf);
                         return alive = flush();
-                    });
+                    }, prefix.get());
                     if (alive) {
                         enc->finish(buf);
                         if (flush() && sse) {
@@ -296,11 +299,11 @@ int run_server(const ServerOptions & opts) {
 
         res.set_chunked_content_provider(
             "audio/pcm",
-            [&model, &codec, g, lock, sr, verbose = opts.verbose](size_t, httplib::DataSink & sink) {
+            [&model, &codec, g, lock, sr, verbose = opts.verbose, prefix](size_t, httplib::DataSink & sink) {
                 run_generation(model, codec, g, sr, verbose, [&](const float * s, int n) {
                     const std::vector<uint8_t> pcm = to_pcm16(s, n);
                     return sink.write((const char *) pcm.data(), pcm.size());
-                });
+                }, prefix.get());
                 sink.done();
                 return true;
             });

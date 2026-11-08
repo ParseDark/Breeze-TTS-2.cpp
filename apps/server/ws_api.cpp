@@ -112,6 +112,8 @@ struct Piece {
 
 struct Session {
     GenSession gen;
+    // the process wide reference cache, so the prefill of a voice survives the request that made it
+    RefPrefix * prefix = nullptr;
     std::mutex mu;
     std::condition_variable cv;
     std::deque<Piece> queue;
@@ -204,7 +206,7 @@ static void handle_start(WsConn & conn, Session & s, const std::string & msg, Br
     s.budget = (int) json_num(msg, "split_chars", split_chars);
     // streaming drains sentence by sentence, so it always needs a real budget to aim at
     if (s.budget <= 0) s.budget = 600;
-    s.gen.begin(model, codec, g);
+    s.gen.begin(model, codec, g, nullptr, s.prefix);
     s.started = true;
     s.queue.clear();
     s.buffer.clear();
@@ -213,8 +215,9 @@ static void handle_start(WsConn & conn, Session & s, const std::string & msg, Br
 }
 
 void ws_connection(WsConn & conn, BreezeModel & model, MimiCodec & codec, VoiceStore & store,
-                   std::mutex & gpu, int chunk_first, int chunk_max, int split_chars) {
+                   std::mutex & gpu, RefPrefix & prefix, int chunk_first, int chunk_max, int split_chars) {
     Session s;
+    s.prefix = &prefix;
     std::thread worker([&] { speaker(conn, s, gpu); });
     event(conn, "ready", "\"sample_rate\":24000,\"format\":\"s16le\"");
 

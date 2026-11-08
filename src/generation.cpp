@@ -23,23 +23,53 @@ static Seg text_seg(BreezeModel & m, const std::string & s) {
     return seg;
 }
 
+// the clip a voice is cloned from and the text to speak are separate segments because the first one
+// never changes between the pieces of a long text, so its prefill is worth keeping (see RefPrefix)
+static void add_ref_segments(std::vector<Seg> & segs, BreezeModel & m, bool has_ref,
+                             const std::string & ref_text, const std::vector<int> & ref_codes, int ref_T) {
+    if (!has_ref) return;
+    segs.push_back(text_seg(m, "[S0]" + ref_text));
+    Seg a;
+    a.is_text = false;
+    a.codes = ref_codes;
+    a.n_frames = ref_T;
+    a.eos = true;
+    segs.push_back(a);
+}
+
+static void add_text_segment(std::vector<Seg> & segs, BreezeModel & m, const GenRequest & r,
+                             const std::string & text, bool cond) {
+    const std::string spk = "[S0]";
+    const std::string tail = cond ? spk + "<ins_bos>" + r.instruction + "<ins_eos>" + text : spk + text;
+    segs.push_back(text_seg(m, tail));
+}
+
 static std::vector<Seg> build_segments(BreezeModel & m, const GenRequest & r, const std::string & text,
                                        bool has_ref, const std::string & ref_text,
                                        const std::vector<int> & ref_codes, int ref_T, bool cond) {
     std::vector<Seg> segs;
-    const std::string spk = "[S0]";
-    if (has_ref) {
-        segs.push_back(text_seg(m, spk + ref_text));
-        Seg a;
-        a.is_text = false;
-        a.codes = ref_codes;
-        a.n_frames = ref_T;
-        a.eos = true;
-        segs.push_back(a);
-    }
-    std::string tail = cond ? spk + "<ins_bos>" + r.instruction + "<ins_eos>" + text : spk + text;
-    segs.push_back(text_seg(m, tail));
+    add_ref_segments(segs, m, has_ref, ref_text, ref_codes, ref_T);
+    add_text_segment(segs, m, r, text, cond);
     return segs;
+}
+
+// how many positions the segments occupy, an audio segment also carries its eos frame
+static int seg_tokens(const std::vector<Seg> & segs) {
+    int n = 0;
+    for (const Seg & s : segs) n += s.is_text ? (int) s.tokens.size() : s.n_frames + 1;
+    return n;
+}
+
+// two clips can share a transcript and land on the same frame count without being the same clip, and
+// the cache keeps the acoustic states of whichever one built it, so the codes go into the key too
+static uint64_t codes_sig(const std::vector<int> & codes) {
+    uint64_t h = 1469598103934665603ull;
+    for (int c : codes) {
+        h ^= (uint32_t) c;
+        h *= 1099511628211ull;
+        h ^= h >> 29;
+    }
+    return h;
 }
 
 static std::vector<float> assemble(BreezeModel & m, const std::vector<Seg> & segs, int & total) {
@@ -83,7 +113,8 @@ struct ChunkRef {
 static bool generate_chunk(BreezeModel & m, MimiCodec & codec, const GenRequest & req,
                            const std::string & text, const ChunkRef & ref, uint32_t seed,
                            const AudioCallback & cb, GenTimings & tm,
-                           std::chrono::steady_clock::time_point t_start, PlayClock & clock, ChunkRef & out) {
+                           std::chrono::steady_clock::time_point t_start, PlayClock & clock, ChunkRef & out,
+                           RefPrefix * pre, int tail_hint) {
     const auto clock_now = [] { return std::chrono::steady_clock::now(); };
     const auto since = [](std::chrono::steady_clock::time_point t) {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
@@ -97,25 +128,85 @@ static bool generate_chunk(BreezeModel & m, MimiCodec & codec, const GenRequest 
 
     const std::vector<int> & ref_codes = ref.codes;
     const int ref_T = ref.n_frames;
+    const int max_new = req.max_new_tokens > 0 ? req.max_new_tokens : m.cfg.max_new_tokens;
+
+    std::vector<Seg> head;
+    add_ref_segments(head, m, has_ref, ref.text, ref_codes, ref_T);
+    const int n_head = seg_tokens(head);
+
+    std::vector<Seg> tail_c, tail_u;
+    add_text_segment(tail_c, m, req, text, true);
+    const int n_tail_c = seg_tokens(tail_c);
+    if (use_cfg) add_text_segment(tail_u, m, req, text, false);
+    const int n_tail_u = use_cfg ? seg_tokens(tail_u) : 0;
+
+    // the reference sits at the front of the cache and nothing later writes there, so a piece that
+    // finds it already there only has to prefill its own text. every piece of a long text used to
+    // redo the whole clip, which is the single biggest cost of splitting one. the hint keeps the
+    // allocation large enough for the longest piece so the caches are not rebuilt mid text
+    const int need_c = n_head + std::max(n_tail_c, tail_hint) + max_new + 8;
+    const int need_u = n_head + std::max(n_tail_u, tail_hint) + max_new + 8;
+    // room for a somewhat longer piece next time, rebuilding throws the reference prefill away and
+    // costs a lot more than the positions are worth
+    const int slack = 128;
+    const uint64_t sig = has_ref ? codes_sig(ref_codes) : 0;
+    const bool reuse = pre && pre->c && pre->ready && has_ref && pre->text == ref.text &&
+                       pre->frames == ref_T && pre->sig == sig && pre->len == n_head &&
+                       pre->c->kv.max_seq >= need_c && (!use_cfg || (pre->u && pre->u->kv.max_seq >= need_u));
+
+    if (pre && !reuse) pre->clear();
+    if (pre && !pre->c) { pre->c = std::make_unique<BackboneState>(); pre->c->init(m, need_c + slack); }
+    if (pre && use_cfg && !pre->u) { pre->u = std::make_unique<BackboneState>(); pre->u->init(m, need_u + slack); }
+    if (pre) {
+        pre->c->pos = reuse ? n_head : 0;
+        if (use_cfg) pre->u->pos = reuse ? n_head : 0;
+    }
+    // without a session to cache in the states are thrown away with the piece, which is what a warm
+    // up or a voice conversion wants anyway
+    BackboneState local_c, local_u;
+    BackboneState & st_c = pre ? *pre->c : local_c;
+    BackboneState & st_u = pre && use_cfg ? *pre->u : local_u;
+    if (!pre) {
+        st_c.init(m, need_c);
+        if (use_cfg) st_u.init(m, need_u);
+    }
 
     auto t0 = clock_now();
     int total_c = 0, total_u = 0;
-    std::vector<float> emb_c = assemble(m, build_segments(m, req, text, has_ref, ref.text, ref_codes, ref_T, true), total_c);
+    std::vector<float> emb_c;
+    if (reuse) {
+        emb_c = assemble(m, tail_c, total_c);
+    } else {
+        std::vector<Seg> all = head;
+        all.insert(all.end(), tail_c.begin(), tail_c.end());
+        emb_c = assemble(m, all, total_c);
+    }
     std::vector<float> emb_u;
-    if (use_cfg) emb_u = assemble(m, build_segments(m, req, text, has_ref, ref.text, ref_codes, ref_T, false), total_u);
+    if (use_cfg) {
+        if (reuse) {
+            emb_u = assemble(m, tail_u, total_u);
+        } else {
+            std::vector<Seg> all = head;
+            all.insert(all.end(), tail_u.begin(), tail_u.end());
+            emb_u = assemble(m, all, total_u);
+        }
+    }
     tm.prompt += since(t0);
-
-    const int max_new = req.max_new_tokens > 0 ? req.max_new_tokens : m.cfg.max_new_tokens;
-
-    BackboneState st_c, st_u;
-    st_c.init(m, total_c + max_new + 8);
-    if (use_cfg) st_u.init(m, total_u + max_new + 8);
 
     t0 = clock_now();
     StepOut o_c = backbone_run(m, st_c, emb_c, total_c);
     StepOut o_u;
     if (use_cfg) o_u = backbone_run(m, st_u, emb_u, total_u);
     tm.prefill += since(t0);
+
+    // the piece stays in the cache, the next one rewinds to the end of the reference
+    if (pre) {
+        pre->ready = has_ref;
+        pre->len = n_head;
+        pre->text = ref.text;
+        pre->frames = ref_T;
+        pre->sig = sig;
+    }
 
     DepthRunner depth;
     depth.init(m, use_cfg ? 2 : 1);
@@ -223,8 +314,8 @@ static bool generate_chunk(BreezeModel & m, MimiCodec & codec, const GenRequest 
     }
     if (!stopped) stopped = !flush(true);
 
-    st_c.free();
-    if (use_cfg) st_u.free();
+    // the states belong to the session when there is a prefix cache, freeing them here would throw
+    // the reference away, and the local pair frees itself
     depth.free();
 
     out.codes = std::move(frames);
@@ -233,13 +324,21 @@ static bool generate_chunk(BreezeModel & m, MimiCodec & codec, const GenRequest 
     return !stopped;
 }
 
-void GenSession::begin(BreezeModel & m, MimiCodec & codec, const GenRequest & req, GenTimings * tm) {
+void GenSession::begin(BreezeModel & m, MimiCodec & codec, const GenRequest & req, GenTimings * tm,
+                       RefPrefix * pre) {
     m_model = &m;
     m_codec = &codec;
     m_req = req;
     m_piece = 0;
     m_start = std::chrono::steady_clock::now();
     m_clock = PlayClock();
+    // one request may be a different voice than the last, the caller's cache is only reused when the
+    // reference it holds is the one this request asks for
+    m_pre = pre;
+    if (!m_pre) {
+        m_own_pre.clear();
+        m_pre = &m_own_pre;
+    }
     m_codes.clear();
     m_frames = 0;
     m_text.clear();
@@ -257,7 +356,7 @@ void GenSession::begin(BreezeModel & m, MimiCodec & codec, const GenRequest & re
     }
 }
 
-bool GenSession::speak(const std::string & text, const AudioCallback & cb, GenTimings * tm) {
+bool GenSession::speak(const std::string & text, const AudioCallback & cb, GenTimings * tm, int tail_hint) {
     if (!m_model || !m_codec) return false;
     GenTimings sink;
     GenTimings & t = tm ? *tm : sink;
@@ -269,7 +368,8 @@ bool GenSession::speak(const std::string & text, const AudioCallback & cb, GenTi
 
     ChunkRef made;
     const bool ok = generate_chunk(*m_model, *m_codec, m_req, text, anchor,
-                                   (uint32_t) m_req.seed + m_piece, cb, t, m_start, m_clock, made);
+                                   (uint32_t) m_req.seed + m_piece, cb, t, m_start, m_clock, made, m_pre,
+                                   tail_hint);
     m_piece++;
     // the opening piece stands in as the reference when there was no clip to clone
     if (ok && m_codes.empty() && made.n_frames > 0) {
@@ -283,12 +383,12 @@ bool GenSession::speak(const std::string & text, const AudioCallback & cb, GenTi
 // long text is generated piece by piece, each one carrying the same reference so the voice does
 // not change at the seams
 void generate(BreezeModel & m, MimiCodec & codec, const GenRequest & req, const AudioCallback & cb,
-              GenTimings * timings) {
+              GenTimings * timings, RefPrefix * pre) {
     GenTimings sink;
     GenTimings & tm = timings ? *timings : sink;
 
     GenSession s;
-    s.begin(m, codec, req, &tm);
+    s.begin(m, codec, req, &tm, pre);
 
     // a half minute of reference makes the model skip whole sentences of whatever comes next, so
     // when the first piece has to double as the reference it stays near the usual clip length
@@ -296,8 +396,17 @@ void generate(BreezeModel & m, MimiCodec & codec, const GenRequest & req, const 
     const std::vector<std::string> parts =
         split_text(req.text, req.split_chars, s.needs_anchor() ? anchor_chars : 0);
 
+    // size the caches for the longest piece up front, a rebuild in the middle throws the reference
+    // prefill away and costs more than the room is worth
+    int longest = 0;
+    for (const std::string & part : parts) {
+        std::vector<Seg> segs;
+        add_text_segment(segs, m, req, part, true);
+        longest = std::max(longest, seg_tokens(segs));
+    }
+
     for (const std::string & part : parts)
-        if (!s.speak(part, cb, &tm)) return;
+        if (!s.speak(part, cb, &tm, longest)) return;
 }
 
 void warm_up(BreezeModel & m, MimiCodec & codec, const GenRequest & base) {

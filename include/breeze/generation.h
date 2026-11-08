@@ -6,7 +6,9 @@
 #include "breeze/model.h"
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -86,8 +88,31 @@ struct GenTimings {
     int frames = 0, flushes = 0, first_frames = 0;
 };
 
+// A cloned voice starts every prompt with the same reference clip, and a long text is spoken as
+// several pieces that each carry that same reference. Prefilling it once and rewinding to the end of
+// it saves the whole clip's prefill on every piece after the first.
+struct RefPrefix {
+    std::unique_ptr<BackboneState> c, u;
+    std::string text;  // transcript the prefix was built from
+    int frames = 0;    // reference frames in it
+    int len = 0;       // positions it occupies at the front of the caches
+    uint64_t sig = 0;  // fingerprint of the reference codes, two clips can share a transcript and length
+    bool ready = false;
+
+    // drop the caches so the next piece prefills the reference again
+    void clear() {
+        c.reset();
+        u.reset();
+        text.clear();
+        frames = 0;
+        len = 0;
+        sig = 0;
+        ready = false;
+    }
+};
+
 void generate(BreezeModel & m, MimiCodec & codec, const GenRequest & req, const AudioCallback & cb,
-              GenTimings * timings = nullptr);
+              GenTimings * timings = nullptr, RefPrefix * pre = nullptr);
 
 // runs a throwaway generation so the first real request doesnt pay for pipeline setup
 void warm_up(BreezeModel & m, MimiCodec & codec, const GenRequest & base);
@@ -95,10 +120,13 @@ void warm_up(BreezeModel & m, MimiCodec & codec, const GenRequest & base);
 // text that arrives a bit at a time, the reference and play clock carry over between pieces
 class GenSession {
 public:
-    void begin(BreezeModel & m, MimiCodec & codec, const GenRequest & req, GenTimings * tm = nullptr);
+    void begin(BreezeModel & m, MimiCodec & codec, const GenRequest & req, GenTimings * tm = nullptr,
+               RefPrefix * pre = nullptr);
 
-    // speaks one piece. false means the callback asked to stop
-    bool speak(const std::string & text, const AudioCallback & cb, GenTimings * tm = nullptr);
+    // speaks one piece. false means the callback asked to stop. tail_hint is the longest piece the
+    // caller is going to send, so the caches can be sized once instead of growing mid text
+    bool speak(const std::string & text, const AudioCallback & cb, GenTimings * tm = nullptr,
+               int tail_hint = 0);
 
     void set_instruction(const std::string & s) { m_req.instruction = s; }
 
@@ -109,6 +137,9 @@ private:
     BreezeModel * m_model = nullptr;
     MimiCodec * m_codec = nullptr;
     GenRequest m_req;
+    // the caller's prefix cache when it has one, otherwise a private one that dies with the session
+    RefPrefix * m_pre = nullptr;
+    RefPrefix m_own_pre;
     std::vector<int> m_codes;
     std::string m_text;
     int m_frames = 0;
